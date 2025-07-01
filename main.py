@@ -9,12 +9,11 @@ app = FastAPI()
 # 允许所有来源跨域（开发测试用，生产环境请限制具体域名）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 也可以写成 ["http://localhost:3000"] 等
+    allow_origins=["*"],  # 也可以限制具体前端地址
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # 模拟数据库
 users_db = {}
@@ -52,6 +51,8 @@ def logout(Authorization: str = Header(...)):
     if not username:
         raise HTTPException(status_code=401, detail="无效Token")
     users_db[username]["online"] = False
+    if username in online_users:
+        del online_users[username]
     return {"message": "登出成功"}
 
 @app.post("/api/users/me/key")
@@ -84,19 +85,30 @@ def get_online_users(Authorization: str = Header(...)):
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
+    print("🟡 客户端尝试建立 WebSocket 连接")
+
     try:
-        token = ws.query_params["token"]
+        token = ws.query_params.get("token")
+        print("📦 收到 token:", token)
         username = decode_token(token)
-        if not username:
+        print("🧑‍💻 解析到用户名:", username)
+        print("📃 当前注册用户列表:", list(users_db.keys()))
+
+        # 验证token和用户是否有效
+        if not username or username not in users_db:
+            print("❌ 无效 Token 或用户未注册，拒绝连接")
             await ws.close(code=1008)
             return
+
         users_db[username]["online"] = True
         online_users[username] = ws
+        print(f"✅ 用户 {username} 已上线，开始监听消息")
 
         while True:
             data = await ws.receive_json()
             if data["type"] == "message:send":
                 to_user = data["payload"]["to"]
+                print(f"✉️ {username} 向 {to_user} 发送消息")
                 if to_user in online_users:
                     await online_users[to_user].send_json({
                         "type": "message:receive",
@@ -105,7 +117,17 @@ async def websocket_endpoint(ws: WebSocket):
                             "encryptedContent": data["payload"]["encryptedContent"]
                         }
                     })
+                else:
+                    print(f"⚠️ 发送失败，用户 {to_user} 不在线")
+
     except WebSocketDisconnect:
+        print(f"⚠️ 用户 {username} 已断开连接")
         users_db[username]["online"] = False
         if username in online_users:
             del online_users[username]
+    except Exception as e:
+        print(f"🚨 WebSocket异常：{e}")
+        if username in online_users:
+            del online_users[username]
+        users_db[username]["online"] = False
+        await ws.close(code=1011)
