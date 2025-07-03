@@ -2,6 +2,7 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header
 from pydantic import BaseModel
 import logging
+import asyncio
 
 from auth import hash_password, verify_password, create_token, decode_token
 from db import init_db
@@ -47,7 +48,7 @@ class PublicKeyPayload(BaseModel):
 @app.post("/api/user/register")
 async def register(data: UserRegister):
     logger.info(f"Registration attempt for user: '{data.username}'")
-    # 检查用户是否已存在
+    # 检查用户是否已存在    
     existing_user = await User.find_one(User.username == data.username)
     if existing_user:
         raise HTTPException(status_code=409, detail="用户名已存在")
@@ -106,62 +107,122 @@ async def get_user_key(username: str, Authorization: str = Header(...)):
 
 @app.get("/api/users/online")
 async def get_online_users(Authorization: str = Header(...)):
-    # ... (Token验证逻辑保持不变)
-    # 直接返回内存中在线用户的列表
-    return {
-        "users": [{"username": u, "status": "online"} for u in online_users.keys()]
-    }
+    # 验证token，确保只有登录用户才能调用此接口
+    current_user = decode_token(Authorization.replace("Bearer ", ""))
+    if not current_user:
+        raise HTTPException(status_code=401, detail="无效Token")
 
+    # 构建包含IP和端口的在线用户列表
+    # 我们不应该把请求者自己包含在列表里
+    user_list = [
+        {
+            "username": username,
+            "ip": info["ip"],
+            "port": info["port"]
+        }
+        for username, info in online_users.items() if username != current_user
+    ]
+    
+    return {"users": user_list}
+
+
+# --- 辅助函数 ---
+def get_formatted_online_list(exclude_username: str = None) -> list:
+    """获取格式化的在线用户列表，可以排除某个用户。"""
+    user_list = []
+    for username, info in online_users.items():
+        if username != exclude_username:
+            user_list.append({
+                "username": username,
+                "ip": info["ip"],
+                "port": info["port"]
+            })
+    return user_list
+
+async def broadcast(message: dict, exclude_username: str = None):
+    """向所有在线用户（可排除某个用户）广播消息。"""
+    tasks = [
+        info["ws"].send_json(message)
+        for username, info in online_users.items()
+        if username != exclude_username
+    ]
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
+# --- WebSocket 端点 ---
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     username = None
     try:
         await ws.accept()
-        
         ip, port = ws.client
-        logger.info(f"WebSocket connection attempt from IP: {ip}, Port: {port}")
-
+        
         token = ws.query_params.get("token")
         username = decode_token(token)
         
-        # 验证用户是否存在于数据库中
         user = await User.find_one(User.username == username)
         if not user:
             await ws.close(code=1008)
             return
 
-        online_users[username] = {
-            "ws": ws,
-            "ip": ip,
-            "port": port
-        }
-        logger.info(f"User '{username}' connected from {ip}:{port}. Total online users: {len(online_users)}")
+        # --- 关键逻辑 ---
 
+        # 1. 向新上线的用户发送当前所有其他在线用户的列表
+        online_list = get_formatted_online_list(exclude_username=username)
+        await ws.send_json({
+            "type": "friends:online_list",
+            "payload": online_list
+        })
+        logger.info(f"Sent online list to '{username}'.")
+
+        # 2. 向所有其他用户广播“新用户上线”的通知
+        await broadcast({
+            "type": "friend:online",
+            "payload": {"username": username, "ip": ip, "port": port}
+        }, exclude_username=username)
+        logger.info(f"Broadcasted 'friend:online' for '{username}'.")
+
+        # 3. 将新用户加入在线列表
+        online_users[username] = {"ws": ws, "ip": ip, "port": port}
+        logger.info(f"User '{username}' connected. Total online: {len(online_users)}")
+
+        # 4. 循环监听消息 (逻辑不变)
         while True:
             data = await ws.receive_json()
-            if data["type"] == "message:send":
+                        if data["type"] == "message:send":
                 to_user = data["payload"]["to"]
-                # 检查接收方是否在线
                 if to_user in online_users:
-                    # 获取接收方的WebSocket对象并发送消息
-                    recipient_ws = online_users[to_user]["ws"]
-                    await recipient_ws.send_json({
+                    await online_users[to_user]["ws"].send_json({
                         "type": "message:receive",
+                        "payload": { "from": username, "encryptedContent": data["payload"]["encryptedContent"] }
+                    })
+            elif data["type"] == "file:send":
+                to_user = data["payload"]["to"]
+                if to_user in online_users:
+                    # Forward the entire file payload to the recipient
+                    await online_users[to_user]["ws"].send_json({
+                        "type": "file:receive",
                         "payload": {
                             "from": username,
-                            "encryptedContent": data["payload"]["encryptedContent"]
+                            "fileName": data["payload"]["fileName"],
+                            "fileType": data["payload"]["fileType"],
+                            "encryptedFile": data["payload"]["encryptedFile"],
+                            "encryptedKey": data["payload"]["encryptedKey"],
                         }
                     })
-                else:
-                    logger.warning(f"Message from '{username}' to '{to_user}' failed: Recipient not online.")
-    
+                    logger.info(f"Relayed file from '{username}' to '{to_user}'.")
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected for user: {username}")
+        logger.info(f"User '{username}' disconnected.")
     except Exception as e:
-        logger.error(f"WebSocket error for user {username}: {e}", exc_info=True)
+        logger.error(f"WebSocket error for user '{username}': {e}", exc_info=True)
     finally:
-        # 清理工作：确保用户从在线列表中移除
+        # 5. 清理并广播“用户下线”通知
         if username and username in online_users:
             del online_users[username]
-            logger.info(f"User '{username}' removed from online list. Total online users: {len(online_users)}")
+            await broadcast({
+                "type": "friend:offline",
+                "payload": { "username": username }
+            })
+            logger.info(f"Broadcasted 'friend:offline' for '{username}'.")
