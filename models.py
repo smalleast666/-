@@ -13,7 +13,7 @@ class User(Document):
     # Indexed确保username字段是唯一的，并为其创建索引以加快查询速度
     username: Indexed(str, unique=True)
     password_hash: str
-    public_key: Optional[str] = None
+    public_key: Optional[str] = None # 公钥是可选的
 
     class Settings:
         # 定义这个模型对应MongoDB中的哪个集合（collection）

@@ -98,12 +98,20 @@ async def upload_key(data: PublicKeyPayload, Authorization: str = Header(...)):
 
 @app.get("/api/users/{username}/key")
 async def get_user_key(username: str, Authorization: str = Header(...)):
-    # ... (Token验证逻辑保持不变)
+    # --- 新增：Token验证逻辑 ---
+    requester_username = decode_token(Authorization.replace("Bearer ", ""))
+    if not requester_username:
+        raise HTTPException(status_code=401, detail="无效或过期的Token")
+    
+    logger.info(f"User '{requester_username}' is requesting public key for '{username}'")
+    # -------------------------
+
     user = await User.find_one(User.username == username)
     if not user or not user.public_key:
-        raise HTTPException(status_code=404, detail="该用户未上传公钥")
+        raise HTTPException(status_code=404, detail="该用户不存在或未上传公钥")
     
     return {"username": username, "publicKey": user.public_key}
+
 
 @app.get("/api/users/online")
 async def get_online_users(Authorization: str = Header(...)):
@@ -190,7 +198,7 @@ async def websocket_endpoint(ws: WebSocket):
         # 4. 循环监听消息 (逻辑不变)
         while True:
             data = await ws.receive_json()
-                        if data["type"] == "message:send":
+            if data["type"] == "message:send":
                 to_user = data["payload"]["to"]
                 if to_user in online_users:
                     await online_users[to_user]["ws"].send_json({
